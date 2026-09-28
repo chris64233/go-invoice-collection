@@ -1,2 +1,14 @@
-// Package goinvoicecollection provides the starting point for the task.
+// Package goinvoicecollection 实现应收发票收款的多发票分配与原路撤销。
+//
+// 核心能力：
+//   - 登记收款时手工指定每张发票的分配金额，或按发票到期日从早到晚自动分配；
+//   - 一次收款的全部分配在单个数据库事务内整体写入，条件更新保证分配不会
+//     超过任何发票的未付余额，跨进程/跨连接的并发收款不会重复结清同一余额；
+//   - 以外部收款号为幂等键：同号、同金额、同分配方式返回首次记录，同号内容
+//     改变返回 KindConflict 错误；金额全程用整数最小货币单位（Money）精确表示；
+//   - 未分配余款在 payments.unallocated_amount 中明确保留；
+//   - 撤销引用原收款并逐项冲回当时的分配，发票按实际冲回金额恢复为部分未付
+//     或未付；多次部分撤销累计不得超过原收款；
+//   - 撤销与新收款并发时由数据库事务（SQLite BEGIN IMMEDIATE 串行写事务 +
+//     条件 UPDATE）保证最终账本一致，不依赖进程内锁。
 package goinvoicecollection
