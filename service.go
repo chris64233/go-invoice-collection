@@ -387,7 +387,8 @@ func paymentFingerprint(in RegisterPaymentInput) string {
 //   - Instructions 为空：按 FIFO 冲回——优先冲回最早建立、仍有余额
 //     的分配，若收款含未分配余款且冲回额超过分配总额，其余冲回余款；
 //   - Instructions 非空：逐项指定冲回哪条原分配（AllocationID），
-//     每条不超过其剩余可冲回金额；
+//     每条不超过其剩余可冲回金额；AllocationID 留空的条目冲回该收款
+//     明确保留的未分配余款（至多一条，且不超过余款余额）；
 //   - 同一收款多次撤销的累计金额不得超过收款额；
 //   - 被冲回的发票按实际冲回金额恢复为部分未付或未付；
 //   - ExternalNo 非空时作为撤销幂等键，同号不同内容返回 KindConflict。
@@ -404,10 +405,6 @@ func (s *Service) CreateRefund(ctx context.Context, in CreateRefundInput) (Creat
 			"FIFO refund requires a positive amount (use RefundableAmount for full refund)")
 	}
 	for i, ins := range in.Instructions {
-		if strings.TrimSpace(ins.AllocationID) == "" {
-			return CreateRefundResult{}, kindError(KindValidation,
-				"instruction %d: allocation id is required (FIFO refunds unallocated remainder automatically)", i+1)
-		}
 		if !ins.Amount.IsPositive() {
 			return CreateRefundResult{}, kindError(KindValidation,
 				"instruction %d: amount must be positive", i+1)
@@ -486,12 +483,26 @@ type refundLine struct {
 func buildItemizedRefund(ctx context.Context, tx *sql.Tx, payment paymentRow, in CreateRefundInput) ([]refundLine, error) {
 	var total Money
 	seen := map[string]struct{}{}
+	var unallocatedWant Money
+	emptyEntries := 0
 	for i, ins := range in.Instructions {
-		if _, dup := seen[ins.AllocationID]; dup {
-			return nil, kindError(KindValidation,
-				"instruction %d: allocation %q listed more than once", i+1, ins.AllocationID)
+		allocID := strings.TrimSpace(ins.AllocationID)
+		if allocID == "" {
+			// 留空 AllocationID 的条目表示冲回该收款明确保留的未分配余款。
+			emptyEntries++
+			if emptyEntries > 1 {
+				return nil, kindError(KindValidation,
+					"instruction %d: only one unallocated-remainder entry is allowed per refund", i+1)
+			}
+			unallocatedWant = unallocatedWant.Add(ins.Amount)
+			total = total.Add(ins.Amount)
+			continue
 		}
-		seen[ins.AllocationID] = struct{}{}
+		if _, dup := seen[allocID]; dup {
+			return nil, kindError(KindValidation,
+				"instruction %d: allocation %q listed more than once", i+1, allocID)
+		}
+		seen[allocID] = struct{}{}
 		total = total.Add(ins.Amount)
 	}
 	if !in.Amount.IsZero() && in.Amount != total {
@@ -502,6 +513,11 @@ func buildItemizedRefund(ctx context.Context, tx *sql.Tx, payment paymentRow, in
 		return nil, kindError(KindConflict,
 			"refund total %s plus already refunded %s exceeds payment amount %s",
 			total, Money(payment.refundedAmount), Money(payment.amount))
+	}
+	if unallocatedWant > Money(payment.unallocatedAmount) {
+		return nil, kindError(KindConflict,
+			"unallocated refund %s exceeds remaining unallocated amount %s of payment %s",
+			unallocatedWant, Money(payment.unallocatedAmount), payment.id)
 	}
 
 	rows, err := tx.QueryContext(ctx, `
@@ -534,10 +550,14 @@ ORDER BY sequence ASC, id ASC`, payment.id)
 
 	lines := make([]refundLine, 0, len(in.Instructions))
 	for i, ins := range in.Instructions {
-		a, ok := allocs[ins.AllocationID]
+		allocID := strings.TrimSpace(ins.AllocationID)
+		if allocID == "" {
+			continue // 余款条目排序后追加在末尾
+		}
+		a, ok := allocs[allocID]
 		if !ok {
 			return nil, kindError(KindNotFound,
-				"allocation %q does not belong to payment %q", ins.AllocationID, payment.id)
+				"allocation %q does not belong to payment %q", allocID, payment.id)
 		}
 		if ins.Amount > a.remaining {
 			return nil, kindError(KindConflict,
@@ -557,6 +577,12 @@ ORDER BY sequence ASC, id ASC`, payment.id)
 	})
 	for i := range lines {
 		lines[i].sequence = i + 1
+	}
+	if unallocatedWant.IsPositive() {
+		lines = append(lines, refundLine{
+			allocationID: "", invoiceID: "", amount: unallocatedWant,
+			sequence: len(lines) + 1,
+		})
 	}
 	return lines, nil
 }

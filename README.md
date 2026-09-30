@@ -16,7 +16,7 @@
 | 外部收款号幂等 | `payments.external_no` 唯一 + 归一化内容指纹（SHA-256）：同号同金额同分配返回首次记录；同号改内容返回 `KindConflict` |
 | 精确金额 | `Money` 为 `int64` 最小货币单位（如分），提供 `ParseMoney` / `String`（两位小数），全程无浮点 |
 | 未分配余款明确保留 | `payments.unallocated_amount`，恒等式 `allocated + unallocated + refunded = amount`（数据库 CHECK 约束） |
-| 撤销引用原收款并逐项冲回 | `Service.CreateRefund`，逐条回写发票与原分配（`allocations.remaining_amount`） |
+| 撤销引用原收款并逐项冲回 | `Service.CreateRefund`，逐条回写发票与原分配（`allocations.remaining_amount`）；逐项模式可用空 `AllocationID` 冲回未分配余款 |
 | 发票恢复部分未付 / 未付 | 冲回时按剩余已付额回算 `status = unpaid | partial` |
 | 多次部分撤销累计不超限 | 收款条件更新 `WHERE refunded_amount + ? <= amount` 及每条分配剩余额条件更新 |
 | 撤销与新收款并发的最终一致 | 全部余额变更只走数据库行上的条件更新，数据库为唯一事实来源 |
@@ -76,6 +76,17 @@ rf2, err := svc.CreateRefund(ctx, goinvoicecollection.CreateRefundInput{
         {AllocationID: pay.Allocations[0].ID, Amount: goinvoicecollection.MustParseMoney("100.00")},
     },
 })
+
+// 逐项冲回未分配余款：AllocationID 留空即表示冲回该收款明确保留的余款
+//（一次撤销至多一条，金额不得超过余款余额），可与普通分配冲回条目混用。
+rf3, err := svc.CreateRefund(ctx, goinvoicecollection.CreateRefundInput{
+    ExternalNo: "EXT-REF-0003",
+    PaymentID:  pay.Payment.ID,
+    Instructions: []goinvoicecollection.RefundInstruction{
+        {AllocationID: pay.Allocations[0].ID, Amount: goinvoicecollection.MustParseMoney("10.00")},
+        {AllocationID: "",                          Amount: goinvoicecollection.MustParseMoney("20.00")},
+    },
+})
 ```
 
 ### 查询
@@ -101,7 +112,8 @@ ledger, _  := svc.ListInvoiceLedger(ctx, inv.ID)   // +分配 / -冲回 流水�
   与幂等 `fingerprint`，CHECK 保证三部分之和恒等于 `amount`；
 - `allocations`：收款 → 发票的分配明细，`remaining_amount` 记录尚未冲回的部分；
 - `refunds` / `refund_items`：撤销主单与逐项冲回明细，引用原分配；
-  冲回未分配余款的条目 `allocation_id / invoice_id` 为 NULL。
+  冲回未分配余款的条目（FIFO 溢出或逐项模式中空 `AllocationID` 的指令）
+  `allocation_id / invoice_id` 为 NULL。
 
 ## 并发与一致性设计
 
@@ -133,10 +145,13 @@ go test -race -count=1 ./...
 - 手工与自动分配（到期日顺序、部分结清、余款保留、超额/重票/跨客户校验）；
 - 收款幂等：同号同内容重放、金额或方式改变冲突、余额不被重复结清；
 - FIFO 撤销（跨分配拆分、冲回未分配余款）、逐项撤销（剩余额限制）、
+  逐项撤销混合冲回分配与未分配余款（空 `AllocationID`、余款超额/重复条目拒绝、
+  幂等重放）、全额撤销后发票重新开放给新收款、
   多次部分撤销累计超额拒绝、撤销幂等与冲突；
 - 分配历史与发票账本流水（正负流水、累计余额、追溯原收款号）；
-- 并发：独立连接池下 20 路收款恰好 10 成功 10 冲突、10 撤销 + 10 新收款
-  交织后的最终账本与流水一致、同号并发请求只产生一条记录。
+- 并发：独立连接池下 20 路手工收款恰好 10 成功 10 冲突、10 撤销 + 10 新收款
+  交织后的最终账本与流水一致、同号并发请求只产生一条记录、
+  20 路自动收款总额恰好分完不超付、10 路逐项撤销同一分配恰好 6 成功 4 冲突。
 
 ## 存储位置
 

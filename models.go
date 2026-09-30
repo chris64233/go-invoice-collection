@@ -138,7 +138,8 @@ type RegisterPaymentResult struct {
 
 // RefundInstruction 逐项撤销时对某条原分配的冲回指令。
 // 不指定 AllocationID（留空）的条目表示冲回该收款的未分配余款；
-// 其 Amount 也可以直接由 AllocationID 决定归属。
+// 一次撤销至多一条这样的条目，且金额不得超过该收款剩余的未分配余款。
+// 可与普通条目混用（例如同时冲回某条分配和部分余款）。
 type RefundInstruction struct {
 	AllocationID string
 	Amount       Money
